@@ -19,83 +19,48 @@
 #include <iostream>
 using namespace std;
 
-/**
- * These are all the pthread functions we hook. Some are more complicated to hook than others.
- */
-typedef void(*pthread_dtor_t)(void*);
-
-static int (*o_pthread_create)(pthread_t*, const pthread_attr_t*, void*(*)(void*), void*);
-static int (*o_pthread_key_delete)(pthread_key_t);
-static int (*o_pthread_equal)(pthread_t, pthread_t);
-static void* (*o_pthread_getspecific)(pthread_key_t);
-static int (*o_pthread_join)(pthread_key_t, void**);
-static pthread_t (*o_pthread_self)(void);
-static int (*o_pthread_setspecific)(pthread_key_t, const void*);
-
-typedef int(pthread_key_create_t)(pthread_key_t*, pthread_dtor_t);
-static pthread_key_create_t* o_pthread_key_create = NULL;
-static pthread_key_create_t& dyn_pthread_key_create();
-
-/**
- * Very early on when this library is loaded there are callers to pthread_key_create,
- * pthread_getspecific, and pthread_setspecific. We normally could pass these calls through down to
- * the original implementation but that doesn't work because dlsym() tries to get a lock which ends
- * up calling pthread_getspecific and pthread_setspecific. So have to implement our own versions of
- * these functions assuming one thread only and then as soon as we can, put all that saved data into
- * a better structure.
- *
- * If there are keys reserved that are lower than `thread_key` we always pass those through to the
- * underlying implementation.
- *
- * This code assumes the underlying pthread library uses increasing TLS keys, while remaining
- * under a constant number of them. These are both not safe assumptions since pthread_t is
- * technically opaque.
- */
-static const size_t MAX_EARLY_KEYS = 500;
-static const void* pthread_early_vals[500] = { NULL };
-static pthread_dtor_t pthread_early_dtors[500] = { NULL };
-static pthread_key_t prev_synthetic_key = NULL;
-static bool did_hook_pthreads = false;
-static bool did_reserve_key = false;
 static pthread_key_t thread_key;
-static bool initialized = false;
+static bool did_hook_v8 = false;
 
 /**
- * Boing
+ * LocalThread is only used internally for this library. It keeps track of all the fibers this
+ * thread is currently running, and handles all the fiber-local storage logic. We store a handle to
+ * a LocalThread object in TLS, and then it emulates TLS on top of fibers.
  */
-void thread_trampoline(void** data);
-
-/**
- * Thread is only used internally for this library. It keeps track of all the fibers this thread
- * is currently running, and handles all the fiber-local storage logic. We store a handle to a
- * Thread object in TLS, and then it emulates TLS on top of fibers.
- */
-class Thread {
+class LocalThread {
   private:
-    static vector<pthread_dtor_t> dtors;
+    static size_t fls_key;
     size_t fiber_ids;
     stack<size_t> freed_fiber_ids;
     vector<vector<void*> > fls_data;
     vector<Coroutine*> fiber_pool;
 
-  public:
-    pthread_t handle;
-    volatile Coroutine* current_fiber;
-    volatile Coroutine* delete_me;
-
-    static void free(void* that) {
-      delete static_cast<Thread*>(that);
-    }
-
-    Thread() : fiber_ids(1), fls_data(1), handle(NULL), delete_me(NULL) {
+    LocalThread() : fiber_ids(1), fls_data(1), delete_me(NULL) {
       current_fiber = new Coroutine(*this, 0);
     }
 
-    ~Thread() {
+    ~LocalThread() {
       assert(freed_fiber_ids.size() == fiber_ids);
       for (size_t ii = 0; ii < fiber_pool.size(); ++ii) {
         delete fiber_pool[ii];
       }
+    }
+
+  public:
+    volatile Coroutine* current_fiber;
+    volatile Coroutine* delete_me;
+
+    static void free(void* that) {
+      delete static_cast<LocalThread*>(that);
+    }
+
+    static LocalThread& get() {
+      LocalThread* thread = static_cast<LocalThread*>(pthread_getspecific(thread_key));
+      if (thread == NULL) {
+        thread = new LocalThread;
+        pthread_setspecific(thread_key, thread);
+      }
+      return *thread;
     }
 
     void coroutine_fls_dtor(Coroutine& fiber) {
@@ -105,14 +70,7 @@ class Thread {
         did_delete = false;
         for (size_t ii = 0; ii < fiber_data.size(); ++ii) {
           if (fiber_data[ii]) {
-            if (dtors[ii]) {
-              void* tmp = fiber_data[ii];
-              fiber_data[ii] = NULL;
-              dtors[ii](tmp);
-              did_delete = true;
-            } else {
-              fiber_data[ii] = NULL;
-            }
+            fiber_data[ii] = NULL;
           }
         }
       } while (did_delete);
@@ -163,28 +121,11 @@ class Thread {
       fls_data[current_fiber->id][key] = (void*)data;
     }
 
-    void key_create(pthread_key_t* key, pthread_dtor_t dtor) {
-      dtors.push_back(dtor);
-      *key = dtors.size() - 1; // TODO: This is NOT thread-safe! =O
-    }
-
-    void key_delete(pthread_key_t key) {
-      if (!dtors[key]) {
-        return;
-      }
-      for (size_t ii = 0; ii < fls_data.size(); ++ii) {
-        if (fls_data[ii].size() <= key) {
-          continue;
-        }
-        while (fls_data[ii][key]) {
-          void* tmp = fls_data[ii][key];
-          fls_data[ii][key] = NULL;
-          dtors[key](tmp);
-        }
-      }
+    static pthread_key_t key_create() {
+      return fls_key++;
     }
 };
-vector<pthread_dtor_t> Thread::dtors;
+size_t LocalThread::fls_key = 0;
 
 /**
  * Coroutine class definition
@@ -196,17 +137,16 @@ void Coroutine::trampoline(Coroutine &that) {
 }
 
 Coroutine& Coroutine::current() {
-  Thread& thread = *static_cast<Thread*>(o_pthread_getspecific(thread_key));
-  return *const_cast<Coroutine*>(thread.current_fiber);
+  return *const_cast<Coroutine*>(LocalThread::get().current_fiber);
 }
 
 const bool Coroutine::is_local_storage_enabled() {
-  return did_hook_pthreads;
+  return did_hook_v8;
 }
 
-Coroutine::Coroutine(Thread& t, size_t id) : thread(t), id(id) {}
+Coroutine::Coroutine(LocalThread& t, size_t id) : thread(t), id(id) {}
 
-Coroutine::Coroutine(Thread& t, size_t id, entry_t& entry, void* arg) :
+Coroutine::Coroutine(LocalThread& t, size_t id, entry_t& entry, void* arg) :
   thread(t),
   id(id),
   stack(STACK_SIZE),
@@ -219,8 +159,7 @@ Coroutine::Coroutine(Thread& t, size_t id, entry_t& entry, void* arg) :
 }
 
 Coroutine& Coroutine::create_fiber(entry_t* entry, void* arg) {
-  Thread& thread = *static_cast<Thread*>(o_pthread_getspecific(thread_key));
-  return thread.create_fiber(*entry, arg);
+  return LocalThread::get().create_fiber(*entry, arg);
 }
 
 void Coroutine::reset(entry_t* entry, void* arg) {
@@ -255,118 +194,98 @@ size_t Coroutine::size() const {
 }
 
 /**
- * TLS hooks
+ * v8 hooks. Trick v8threads.cc into thinking that coroutines are actually threads.
  */
+namespace v8 { namespace internal {
+  /**
+   * ThreadHandle is just a handle to a thread. It's important to note that ThreadHandle does NOT
+   * own the underlying thread. We shim it make IsSelf() respect fibers.
+   */
+  class ThreadHandle {
+    enum Kind { SELF, INVALID };
 
-// See comment above MAX_EARLY_KEYS as to why these functions are difficult to hook.
-// Note well that in the `!initialized` case there is no heap. Calls to malloc, etc will crash your
-// shit.
-void* pthread_getspecific(pthread_key_t key) {
-  if (initialized) {
-    if (thread_key >= key) {
-      return o_pthread_getspecific(key);
-    }
-    Thread& thread = *static_cast<Thread*>(o_pthread_getspecific(thread_key));
-    return thread.get_specific(key - thread_key - 1);
-  } else {
-    // We can't invoke the original function because dlsym tries to call pthread_getspecific
-    return const_cast<void*>(pthread_early_vals[key - thread_key - 1]);
+    /**
+     * PlatformData is a class with a couple of non-virtual methods and a single platform-specific
+     * handle. PlatformData is stored as pointer in the ThreadHandle class so we can add new members
+     * to the end and no one will mess with those members.
+     */
+    class PlatformData {
+      public:
+        pthread_t _;
+        Coroutine* coroutine;
+        void Initialize(ThreadHandle::Kind kind);
+    };
+    ThreadHandle(Kind kind);
+    void Initialize(Kind kind);
+    bool IsSelf() const;
+
+    /**
+     * ThreadHandle's first member is PlatformData* data_. Since all pointers have the same size
+     * as long as v8 doesn't change the layout of this class this is safe.
+     */
+    PlatformData* data;
+  };
+
+  /**
+   * Thread is an abstract class which manages creating and running new threads. In most cases v8
+   * won't actually create any new threads. Notable uses of the Thread class include the profiler,
+   * debugger, and the preemption thread.
+   *
+   * All of the methods we override are static and are just simple wrappers around pthread
+   * functions.
+   *
+   * Note that Thread extends ThreadHandle, but this has no bearing on our implementation.
+   */
+  class Thread : public ThreadHandle {
+    public:
+      enum LocalStorageKey {};
+      static LocalStorageKey CreateThreadLocalKey();
+      static void DeleteThreadLocalKey(LocalStorageKey key);
+      static void* GetThreadLocal(LocalStorageKey key);
+      static void SetThreadLocal(LocalStorageKey key, void* value);
+  };
+
+  /**
+   * Override the constructor to instantiate our own PlatformData.
+   */
+  ThreadHandle::ThreadHandle(Kind kind) {
+    data = new PlatformData;
+    Initialize(kind);
   }
-}
 
-int pthread_setspecific(pthread_key_t key, const void* data) {
-  if (initialized) {
-    if (thread_key >= key) {
-      return o_pthread_setspecific(key, data);
-    }
-    Thread& thread = *static_cast<Thread*>(o_pthread_getspecific(thread_key));
-    thread.set_specific(key - thread_key - 1, data);
-    return 0;
-  } else {
-    pthread_early_vals[key - thread_key - 1] = data;
-    return 0;
+  void ThreadHandle::Initialize(Kind kind) {
+    data->Initialize(kind);
+    data->coroutine = kind == SELF ? &Coroutine::current() : NULL;
   }
-}
 
-static pthread_key_create_t& dyn_pthread_key_create() {
-  did_hook_pthreads = true;
-  if (o_pthread_key_create == NULL) {
-    o_pthread_key_create = (pthread_key_create_t*)dlsym(RTLD_NEXT, "pthread_key_create");
+  /**
+   * Fool v8 into thinking it's in a new thread.
+   */
+  bool ThreadHandle::IsSelf() const {
+    return data->coroutine == &Coroutine::current();
   }
-  return *o_pthread_key_create;
-}
 
-int pthread_key_create(pthread_key_t* key, pthread_dtor_t dtor) {
-  if (initialized) {
-    Thread& thread = *static_cast<Thread*>(o_pthread_getspecific(thread_key));
-    thread.key_create(key, dtor);
-    *key += thread_key + 1;
-    return 0;
-  } else {
-    if (!did_reserve_key) {
-      did_reserve_key = true;
-      dyn_pthread_key_create()(&thread_key, Thread::free);
-      prev_synthetic_key = thread_key;
-    }
-    *key = ++prev_synthetic_key;
-    pthread_early_dtors[*key] = dtor;
-    assert(prev_synthetic_key < MAX_EARLY_KEYS);
-    return 0;
+  /**
+   * All thread-specific functions will just go to the fiber-local storage engine in this source
+   * file.
+   */
+  Thread::LocalStorageKey Thread::CreateThreadLocalKey() {
+    did_hook_v8 = true;
+    return static_cast<LocalStorageKey>(LocalThread::key_create());
   }
-}
 
-/**
- * Other pthread-related hooks.
- */
-
-// Entry point for pthread_create. We need this to record the Thread in real TLS.
-void thread_trampoline(void** args_vector) {
-  void* (*entry)(void*) = (void*(*)(void*))args_vector[0];
-  void* arg = args_vector[1];
-  Thread& thread = *static_cast<Thread*>(args_vector[1]);
-  delete[] args_vector;
-  thread.handle = o_pthread_self();
-  o_pthread_setspecific(thread_key, &thread);
-  entry(arg);
-}
-
-int pthread_create(pthread_t* handle, const pthread_attr_t* attr, void* (*entry)(void*), void* arg) {
-  assert(initialized);
-  void** args_vector = new void*[3];
-  args_vector[0] = (void*)entry;
-  args_vector[1] = arg;
-  Thread* thread = new Thread;
-  args_vector[2] = thread;
-  *handle = (pthread_t)thread;
-  return o_pthread_create(
-    &thread->handle, attr, (void* (*)(void*))thread_trampoline, (void*)args_vector);
-}
-
-int pthread_key_delete(pthread_key_t key) {
-  assert(initialized);
-  if (thread_key >= key) {
-    return o_pthread_key_delete(key);
+  void Thread::DeleteThreadLocalKey(LocalStorageKey key) {
+    // Kidding me?
   }
-  Thread& thread = *static_cast<Thread*>(o_pthread_getspecific(thread_key));
-  thread.key_delete(key - thread_key - 1);
-  return 0;
-}
 
-int pthread_equal(pthread_t left, pthread_t right) {
-  return left == right;
-}
+  void* Thread::GetThreadLocal(Thread::LocalStorageKey key) {
+    return LocalThread::get().get_specific(static_cast<pthread_key_t>(key));
+  }
 
-int pthread_join(pthread_t thread, void** retval) {
-  assert(initialized);
-  // pthread_join should return EDEADLK if you try to join with yourself..
-  return pthread_join(reinterpret_cast<Thread*>(thread)->handle, retval);
-}
-
-pthread_t pthread_self() {
-  assert(initialized);
-  Thread& thread = *static_cast<Thread*>(o_pthread_getspecific(thread_key));
-  return (pthread_t)thread.current_fiber;
-}
+  void Thread::SetThreadLocal(Thread::LocalStorageKey key, void* value) {
+    LocalThread::get().set_specific(static_cast<pthread_key_t>(key), value);
+  }
+}}
 
 /**
  * Initialization of this library. By the time we make it here the heap should be good to go. Also
@@ -374,37 +293,10 @@ pthread_t pthread_self() {
  */
 class Loader {
   public: Loader() {
-    // Grab hooks to the real version of all hooked functions.
-    o_pthread_create = (int(*)(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*))dlsym(RTLD_NEXT, "pthread_create");
-    o_pthread_key_delete = (int(*)(pthread_key_t))dlsym(RTLD_NEXT, "pthread_key_delete");
-    o_pthread_equal = (int(*)(pthread_t, pthread_t))dlsym(RTLD_NEXT, "pthread_equal");
-    o_pthread_getspecific = (void*(*)(pthread_key_t))dlsym(RTLD_NEXT, "pthread_getspecific");
-    o_pthread_join = (int(*)(pthread_key_t, void**))dlsym(RTLD_NEXT, "pthread_join");
-    o_pthread_self = (pthread_t(*)(void))dlsym(RTLD_NEXT, "pthread_self");
-    o_pthread_setspecific = (int(*)(pthread_key_t, const void*))dlsym(RTLD_NEXT, "pthread_setspecific");
-    dyn_pthread_key_create();
+            cout <<"hello\n";
+    pthread_key_create(&thread_key, LocalThread::free);
 
-    // Create a real TLS key to store the handle to Thread.
-    if (!did_reserve_key) {
-      did_reserve_key = true;
-      o_pthread_key_create(&thread_key, Thread::free);
-      prev_synthetic_key = thread_key;
-    }
-    Thread* thread = new Thread;
-    thread->handle = o_pthread_self();
-    o_pthread_setspecific(thread_key, thread);
-
-    // Put all the data from the fake pthread_setspecific into FLS
-    initialized = true;
-    for (size_t ii = thread_key + 1; ii <= prev_synthetic_key; ++ii) {
-      pthread_key_t tmp;
-      thread->key_create(&tmp, pthread_early_dtors[ii]);
-      assert(tmp == ii - thread_key - 1);
-      thread->set_specific(tmp, pthread_early_vals[ii]);
-    }
-
-    // Undo fiber-shim so that child processes don't get shimmed as well. This also seems to prevent
-    // this library from being loaded multiple times.
+    // Undo fiber-shim so that child processes don't get shimmed as well.
     setenv("DYLD_INSERT_LIBRARIES", "", 1);
     setenv("LD_PRELOAD", "", 1);
   }

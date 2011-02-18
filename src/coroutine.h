@@ -9,14 +9,14 @@
 
 class Coroutine {
   public:
-    friend class Thread;
+    friend class LocalThread;
     typedef void(entry_t)(void*);
 
   private:
     // vector<char> will 0 out the memory first which is not necessary; this hack lets us get
     // around that, as there is no constructor.
     struct char_noinit { char x; };
-    class Thread& thread;
+    class LocalThread& thread;
     size_t id;
     ucontext_t context;
     std::vector<char_noinit, __gnu_cxx::__pool_alloc<char_noinit> > stack;
@@ -31,13 +31,13 @@ class Coroutine {
      * need a way to get back into the main thread after yielding to a fiber. Basically this
      * shouldn't be called from anywhere.
      */
-    Coroutine(Thread& t, size_t id);
+    Coroutine(LocalThread& t, size_t id);
 
     /**
      * This constructor will actually create a new fiber context. Execution does not begin
      * until you call run() for the first time.
      */
-    Coroutine(Thread& t, size_t id, entry_t& entry, void* arg);
+    Coroutine(LocalThread& t, size_t id, entry_t& entry, void* arg);
 
     /**
      * Resets the context of this coroutine from the start. Used to recyle old coroutines.
