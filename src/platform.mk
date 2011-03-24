@@ -3,7 +3,7 @@ NODE_PREFIX := $(shell node --vars | egrep ^NODE_PREFIX: | cut -c14-)
 NODE_PLATFORM := $(shell node --vars | egrep -o 'DPLATFORM="[^"]+' | cut -c12-)
 NODE_BITS := $(shell file `which node` | egrep -o '[0-9]{2}-bit' | cut -c-2)
 
-CPPFLAGS = -Wall -I$(NODE_PREFIX)/include -I$(NODE_PREFIX)/include/node
+CPPFLAGS = -Wall -I$(NODE_PREFIX)/include -I$(NODE_PREFIX)/include/node -fPIC
 ifdef DEBUG
 	CPPFLAGS += -ggdb -O0
 else
@@ -25,4 +25,11 @@ ifeq ($(NODE_PLATFORM), linux)
 endif
 ifeq ($(NODE_PLATFORM), darwin)
 	COROUTINE_SO = coroutine.dylib
+endif
+
+ifeq ($(NODE_PLATFORM), linux)
+	CPP_NODEFLAGS = -shared -Wl,-Bdynamic
+endif
+ifeq ($(NODE_PLATFORM), darwin)
+	CPP_NODEFLAGS = -bundle -undefined dynamic_lookup
 endif

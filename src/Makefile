@@ -1,25 +1,13 @@
 include platform.mk
 
-ifeq ($(NODE_PLATFORM), linux)
-	CPP_DYFLAGS = -fPIC -shared
-	CPP_NODEFLAGS = -fPIC -shared -Wl,-Bdynamic
-endif
-ifeq ($(NODE_PLATFORM), darwin)
-	CPP_DYFLAGS = -dynamiclib
-	CPP_NODEFLAGS = -bundle -undefined dynamic_lookup
-endif
-COROUTINE_SO_FULL := $(shell echo `pwd`/$(COROUTINE_SO))
+all: fibers.node
 
-all: $(COROUTINE_SO) fibers.node
+%.o: %.cc
+	$(CXX) $(CPPFLAGS) -c -o $@ $^
 
-$(COROUTINE_SO_FULL): $(COROUTINE_SO)
-
-$(COROUTINE_SO): coroutine.cc
-	$(CXX) $(CPPFLAGS) $(CPP_DYFLAGS) -o $@ $^ -lpthread -ldl
-
-fibers.node: fibers.cc $(COROUTINE_SO_FULL)
-	$(CXX) $(CPPFLAGS) $(CPP_NODEFLAGS) -o $@ $^
+fibers.node: fibers.o coroutine.o
+	$(CXX) $(CPPFLAGS) $(CPP_NODEFLAGS) -o $@ $^ -lpthread
 
 clean:
-	-$(RM) fibers.node $(COROUTINE_SO)
+	-$(RM) fibers.node coroutine.o fibers.o
 	-$(RM) -r *.dSYM

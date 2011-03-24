@@ -2,27 +2,24 @@
 #define _XOPEN_SOURCE
 #endif
 
-#include <stdlib.h>
-#include <ucontext.h>
-#include <ext/pool_allocator.h>
+#include <pthread.h>
 #include <vector>
 
 class Coroutine {
 	public:
-		friend class Thread;
 		typedef void(entry_t)(void*);
 
 	private:
-		// vector<char> will 0 out the memory first which is not necessary; this hack lets us get
-		// around that, as there is no constructor.
-		struct char_noinit { char x; };
-		class Thread& thread;
-		ucontext_t context;
-		std::vector<char_noinit, __gnu_cxx::__pool_alloc<char_noinit> > stack;
-		std::vector<void*> fls_data;
+		static size_t stack_size;
+		static std::vector<Coroutine*> fiber_pool;
+		static pthread_key_t thread_key;
+		static pthread_mutex_t mutex;
+
+		bool started;
 		entry_t* entry;
 		void* arg;
-		static size_t stack_size;
+		pthread_cond_t cond;
+		void* base;
 
 		static void trampoline(Coroutine& that);
 		~Coroutine() {}
@@ -32,20 +29,30 @@ class Coroutine {
 		 * need a way to get back into the main thread after yielding to a fiber. Basically this
 		 * shouldn't be called from anywhere.
 		 */
-		Coroutine(Thread& t);
+		Coroutine();
 
 		/**
 		 * This constructor will actually create a new fiber context. Execution does not begin
 		 * until you call run() for the first time.
 		 */
-		Coroutine(Thread& t, entry_t& entry, void* arg);
+		Coroutine(entry_t& entry, void* arg);
 
 		/**
 		 * Resets the context of this coroutine from the start. Used to recyle old coroutines.
 		 */
 		void reset(entry_t* entry, void* arg);
 
+		/**
+		 * Makes this coroutine runnable.
+		 */
+		void make_runnable();
+
 	public:
+		/**
+		 * Initialize the coroutine library. This will be called automatically; don't call manually!
+		 */
+		static void init();
+
 		/**
 		 * Returns the currently-running fiber.
 		 */
@@ -69,12 +76,6 @@ class Coroutine {
 		 * size is global instead of per-coroutine.
 		 */
 		static void set_stack_size(size_t size);
-
-		/**
-		 * Access to fiber-local storage.
-		 */
-		void* get_specific(pthread_key_t key);
-		void set_specific(pthread_key_t key, const void* data);
 
 		/**
 		 * Start or resume execution in this fiber. Note there is no explicit yield() function,
