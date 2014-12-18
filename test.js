@@ -28,7 +28,7 @@ function runTest(test, cb) {
 
 	proc.on('exit', function(code) {
 		if (stdout !== 'pass\n' || stderr !== '') {
-			console.error(
+			cb(
 				test+ ': *fail*\n'+
 				'code: '+ code+ '\n'+
 				'stderr: '+ stderr+ '\n'+
