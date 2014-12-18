@@ -763,7 +763,7 @@ class Fiber {
 			fn->SetAccessor(uni::NewLatin1Symbol(isolate, "fibersCreated"), GetFibersCreated);
 
 			// Global Fiber
-			target->Set(uni::NewLatin1Symbol(isolate, "Fiber"), fn);
+			target->Set(uni::NewLatin1Symbol(isolate, "Fiber"), fn, ReadOnly);
 			uni::Reset(isolate, fiber_object, fn);
 		}
 };
